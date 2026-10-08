@@ -237,6 +237,16 @@ details .row:last-of-type { margin-bottom: 8px; }
       </div>
     </div>
     <div class="row">
+      <span class="field-label">Яркость</span>
+      <div class="grow">
+        <select id="density" aria-label="Яркость печати">
+          <option value="12">Светлая, быстро</option>
+          <option value="18">Средняя</option>
+          <option value="30" selected>Тёмная, медленнее</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
       <span class="field-label">Команда</span>
       <div class="grow">
         <select id="method" aria-label="Команда печати">
@@ -250,9 +260,9 @@ details .row:last-of-type { margin-bottom: 8px; }
       <span class="field-label">Пакет</span>
       <div class="grow">
         <select id="chunk" aria-label="Размер пакета">
-          <option value="20" selected>20 байт, медленно и надёжно</option>
+          <option value="20">20 байт</option>
           <option value="100">100 байт</option>
-          <option value="180">180 байт, быстро</option>
+          <option value="160" selected>160 байт</option>
         </select>
       </div>
     </div>
@@ -277,19 +287,18 @@ details .row:last-of-type { margin-bottom: 8px; }
         </select>
       </div>
     </div>
-    <p class="hint">Если выходит пустая бумага, попробуйте другую команду. Когда печать заработает, пакет можно увеличить, чтобы было быстрее.</p>
+    <p class="hint">Бледно или с белыми полосами: поставьте яркость темнее. Печать обрывается на середине: поменяйте отправку на «С подтверждением» или уменьшите пакет.</p>
   </details>
 
   <details>
     <summary>Проверка принтера</summary>
     <div class="tests">
-      <button class="btn" id="testText" type="button" disabled>Напечатать TEST</button>
       <button class="btn" id="testBar" type="button" disabled>Напечатать полосу</button>
     </div>
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 3</p>
+  <p class="version">Версия 4</p>
 </main>
 
 <div class="bar">
@@ -338,8 +347,8 @@ details .row:last-of-type { margin-bottom: 8px; }
     text: $('text'), fontSize: $('fontSize'), fontSizeOut: $('fontSizeOut'),
     font: $('font'), bold: $('bold'), file: $('file'), fileLabel: $('fileLabel'),
     preview: $('preview'), empty: $('empty'), sizeNote: $('sizeNote'),
-    width: $('width'), start: $('start'), method: $('method'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
-    testText: $('testText'), testBar: $('testBar'), log: $('log'),
+    width: $('width'), start: $('start'), density: $('density'), method: $('method'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
+    testBar: $('testBar'), log: $('log'),
     status: $('status'), printBtn: $('printBtn')
   };
 
@@ -357,16 +366,17 @@ details .row:last-of-type { margin-bottom: 8px; }
     el.log.scrollTop = el.log.scrollHeight;
   }
   function shortId(uuid) {
+    uuid = String(uuid).toLowerCase();
     var m = /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/.exec(uuid);
     return m ? m[1] : uuid.slice(0, 13);
   }
 
   /* ---------- сохранение настроек ---------- */
-  var KEY = 'thermal-ui-settings-v3';
+  var KEY = 'thermal-ui-settings-v4';
   function saveSettings() {
     try {
       localStorage.setItem(KEY, JSON.stringify({
-        width: el.width.value, start: el.start.value, method: el.method.value, chunk: el.chunk.value,
+        width: el.width.value, start: el.start.value, density: el.density.value, method: el.method.value, chunk: el.chunk.value,
         wmode: el.wmode.value, feed: el.feed.value,
         fontSize: el.fontSize.value, font: el.font.value, bold: el.bold.checked, align: state.align
       }));
@@ -378,6 +388,7 @@ details .row:last-of-type { margin-bottom: 8px; }
       if (!s) return;
       if (s.width) el.width.value = s.width;
       if (s.start) el.start.value = s.start;
+      if (s.density) el.density.value = s.density;
       if (s.method) el.method.value = s.method;
       if (s.chunk) el.chunk.value = s.chunk;
       if (s.wmode) el.wmode.value = s.wmode;
@@ -404,7 +415,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     el.connectBtn.textContent = connected ? 'Отключить' : 'Подключить';
     el.connectBtn.disabled = state.busy || !navigator.bluetooth;
     el.printBtn.disabled = state.busy || !connected || !state.current;
-    el.testText.disabled = el.testBar.disabled = state.busy || !connected;
+    el.testBar.disabled = state.busy || !connected;
     if (!state.busy) el.printBtn.textContent = 'Напечатать';
   }
 
@@ -597,6 +608,14 @@ details .row:last-of-type { margin-bottom: 8px; }
     return out;
   }
 
+  // Скорость подачи данных, байт/с. Чем темнее печать, тем медленнее работает головка:
+  // слишком быстро - переполнится буфер принтера, слишком медленно - белые полосы.
+  function targetRate() {
+    if (el.start.value !== 'yhk') return 4000;
+    var d = +el.density.value;
+    return d >= 30 ? 2000 : d >= 18 ? 3000 : 4500;
+  }
+
   // Задание = список шагов: Uint8Array отправляется, число означает паузу в миллисекундах
   function buildJob(mono) {
     var method = el.method.value;
@@ -606,10 +625,10 @@ details .row:last-of-type { margin-bottom: 8px; }
     var lf = new Uint8Array(feed); lf.fill(0x0A);
     var steps = [];
     if (el.start.value === 'yhk') {
-      // Порядок как в приложении WalkPrint: сброс, запуск печати, картинка, отступ
-      steps.push(new Uint8Array([0x1B, 0x40]), 500);
-      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, 0x19]), 500);
-      steps.push(image, 500);
+      // Порядок как в приложении WalkPrint: сброс, яркость (GS I F0 nn), картинка, отступ
+      steps.push(new Uint8Array([0x1B, 0x40]), 300);
+      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, +el.density.value]), 200);
+      steps.push(image, 300);
     } else {
       steps.push(image);
     }
@@ -632,7 +651,7 @@ details .row:last-of-type { margin-bottom: 8px; }
         var flags = (pr.write ? 'W' : '') + (pr.writeWithoutResponse ? 'w' : '') + (pr.notify ? 'N' : '') + (pr.read ? 'R' : '');
         log('  ' + shortId(c.uuid) + ' [' + flags + ']');
         if (!pr.write && !pr.writeWithoutResponse) continue;
-        var known = KNOWN_WRITE.indexOf(c.uuid);
+        var known = KNOWN_WRITE.indexOf(String(c.uuid).toLowerCase());
         var rank = known >= 0 ? known : 100 + (pr.write ? 0 : 1);
         if (rank < bestRank) { best = c; bestRank = rank; }
       }
@@ -695,7 +714,10 @@ details .row:last-of-type { margin-bottom: 8px; }
     var m = el.wmode.value, pr = state.ch.properties;
     if (m === 'with') return true;
     if (m === 'without') return false;
-    return !!pr.write;
+    if (!pr.writeWithoutResponse) return true;
+    if (!pr.write) return false;
+    // С подтверждением надёжнее, но быстрее ~2,5 КБ/с не разгоняется
+    return targetRate() <= 2500;
   }
 
   async function writeChunk(part, withResponse) {
@@ -707,7 +729,6 @@ details .row:last-of-type { margin-bottom: 8px; }
     }
     if (c.writeValueWithoutResponse) await c.writeValueWithoutResponse(part);
     else await c.writeValue(part);
-    await sleep(30);
   }
 
   async function send(steps, label) {
@@ -718,16 +739,22 @@ details .row:last-of-type { margin-bottom: 8px; }
     var size = +el.chunk.value, wr = useResponse();
     var total = 0, done = 0, i;
     for (i = 0; i < steps.length; i++) if (typeof steps[i] !== 'number') total += steps[i].length;
-    log(label + ': ' + total + ' байт, пакет ' + size + ', ' + (wr ? 'с подтверждением' : 'без подтверждения'));
+    var rate = targetRate();
+    log(label + ': ' + total + ' байт, пакет ' + size + ', ' + (wr ? 'с подтверждением' : 'без подтверждения') + ', цель ' + rate + ' Б/с');
     try {
       for (i = 0; i < steps.length; i++) {
         var step = steps[i];
         if (typeof step === 'number') { await sleep(step); continue; }
+        var segStart = Date.now(), segSent = 0;
         for (var o = 0; o < step.length; o += size) {
           if (!state.ch) throw new Error('disconnected');
           var part = step.slice(o, o + size);
           await writeChunk(part, wr);
           done += part.length;
+          segSent += part.length;
+          // держим ровный темп: не быстрее заданной скорости
+          var wait = segStart + segSent / rate * 1000 - Date.now();
+          if (wait > 0) await sleep(wait);
           el.printBtn.textContent = 'Печатаю… ' + Math.round(done / total * 100) + '%';
         }
       }
@@ -739,7 +766,8 @@ details .row:last-of-type { margin-bottom: 8px; }
     } finally {
       state.busy = false; refreshButtons();
       if (ok) {
-        log('Отправлено за ' + ((Date.now() - t0) / 1000).toFixed(1) + ' с');
+        var sec = (Date.now() - t0) / 1000;
+        log('Отправлено за ' + sec.toFixed(1) + ' с, ' + Math.round(total / sec) + ' Б/с');
         setStatus('Отправлено на принтер');
       }
     }
@@ -748,17 +776,11 @@ details .row:last-of-type { margin-bottom: 8px; }
   function print() {
     if (!state.current) return;
     var m = el.method.value;
-    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (' + el.start.value + ', ' + m + ')');
-  }
-
-  function testText() {
-    var s = 'TEST 12345\n\n\n\n', out = new Uint8Array(s.length);
-    for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-    send([out], 'Тест текста');
+    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (' + el.start.value + ', яркость ' + el.density.value + ', ' + m + ')');
   }
 
   function testBar() {
-    var w = +el.width.value, h = 24;
+    var w = +el.width.value, h = 96; // 12 мм
     var bits = new Uint8Array(w * h);
     bits.fill(1);
     send(buildJob({ bits: bits, w: w, h: h }), 'Тест полосы (' + el.start.value + ', ' + el.method.value + ')');
@@ -783,7 +805,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   [el.font, el.bold, el.width].forEach(function (c) {
     c.addEventListener('change', function () { saveSettings(); schedule(); });
   });
-  [el.start, el.method, el.chunk, el.wmode, el.feed].forEach(function (c) { c.addEventListener('change', saveSettings); });
+  [el.start, el.density, el.method, el.chunk, el.wmode, el.feed].forEach(function (c) { c.addEventListener('change', saveSettings); });
 
   el.file.addEventListener('change', function () {
     var f = el.file.files && el.file.files[0];
@@ -808,7 +830,6 @@ details .row:last-of-type { margin-bottom: 8px; }
     if (state.ch) disconnect(); else connect();
   });
   el.printBtn.addEventListener('click', print);
-  el.testText.addEventListener('click', testText);
   el.testBar.addEventListener('click', testBar);
 
   /* ---------- запуск ---------- */
