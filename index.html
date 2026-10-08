@@ -257,12 +257,20 @@ details .row:last-of-type { margin-bottom: 8px; }
       </div>
     </div>
     <div class="row">
+      <span class="field-label">Канал</span>
+      <div class="grow">
+        <select id="channel" aria-label="Канал Bluetooth">
+          <option value="auto" selected>Авто</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
       <span class="field-label">Пакет</span>
       <div class="grow">
         <select id="chunk" aria-label="Размер пакета">
-          <option value="20">20 байт</option>
+          <option value="20" selected>20 байт</option>
           <option value="100">100 байт</option>
-          <option value="160" selected>160 байт</option>
+          <option value="160">160 байт</option>
         </select>
       </div>
     </div>
@@ -287,18 +295,20 @@ details .row:last-of-type { margin-bottom: 8px; }
         </select>
       </div>
     </div>
-    <p class="hint">Бледно или с белыми полосами: поставьте яркость темнее. Печать обрывается на середине: поменяйте отправку на «С подтверждением» или уменьшите пакет.</p>
+    <p class="hint">Канал, пакет и отправку подбирает автопроверка ниже: поставьте здесь те значения, с которыми номер вышел самым тёмным.</p>
   </details>
 
   <details>
     <summary>Проверка принтера</summary>
     <div class="tests">
+      <button class="btn" id="autoTest" type="button" disabled>Автопроверка</button>
       <button class="btn" id="testBar" type="button" disabled>Напечатать полосу</button>
     </div>
+    <p class="hint">Автопроверка печатает несколько блоков с номерами, каждый своим способом. Занимает около минуты. Потом посмотрите, какие номера видны на бумаге.</p>
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 4</p>
+  <p class="version">Версия 5</p>
 </main>
 
 <div class="bar">
@@ -325,6 +335,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   ];
   // Характеристики, в которые обычно пишут данные для печати (по убыванию приоритета)
   var KNOWN_WRITE = [
+    '49535343-6daa-4d02-abf6-19569aca69fe', // проверено на YHK: печатает через него
     '00002af1-0000-1000-8000-00805f9b34fb',
     '0000ff02-0000-1000-8000-00805f9b34fb',
     '49535343-8841-43f4-a8d4-ecbe34729bb3',
@@ -347,14 +358,14 @@ details .row:last-of-type { margin-bottom: 8px; }
     text: $('text'), fontSize: $('fontSize'), fontSizeOut: $('fontSizeOut'),
     font: $('font'), bold: $('bold'), file: $('file'), fileLabel: $('fileLabel'),
     preview: $('preview'), empty: $('empty'), sizeNote: $('sizeNote'),
-    width: $('width'), start: $('start'), density: $('density'), method: $('method'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
-    testBar: $('testBar'), log: $('log'),
+    width: $('width'), start: $('start'), density: $('density'), method: $('method'), channel: $('channel'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
+    autoTest: $('autoTest'), testBar: $('testBar'), log: $('log'),
     status: $('status'), printBtn: $('printBtn')
   };
 
   var state = {
     mode: 'text', align: 'left',
-    device: null, ch: null,
+    device: null, ch: null, writables: [],
     img: null, current: null, busy: false
   };
 
@@ -372,7 +383,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   }
 
   /* ---------- сохранение настроек ---------- */
-  var KEY = 'thermal-ui-settings-v4';
+  var KEY = 'thermal-ui-settings-v5';
   function saveSettings() {
     try {
       localStorage.setItem(KEY, JSON.stringify({
@@ -415,7 +426,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     el.connectBtn.textContent = connected ? 'Отключить' : 'Подключить';
     el.connectBtn.disabled = state.busy || !navigator.bluetooth;
     el.printBtn.disabled = state.busy || !connected || !state.current;
-    el.testBar.disabled = state.busy || !connected;
+    el.testBar.disabled = el.autoTest.disabled = state.busy || !connected;
     if (!state.busy) el.printBtn.textContent = 'Напечатать';
   }
 
@@ -626,9 +637,9 @@ details .row:last-of-type { margin-bottom: 8px; }
     var steps = [];
     if (el.start.value === 'yhk') {
       // Порядок как в приложении WalkPrint: сброс, яркость (GS I F0 nn), картинка, отступ
-      steps.push(new Uint8Array([0x1B, 0x40]), 300);
-      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, +el.density.value]), 200);
-      steps.push(image, 300);
+      steps.push(new Uint8Array([0x1B, 0x40]), 500);
+      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, +el.density.value]), 300);
+      steps.push(image, 500);
     } else {
       steps.push(image);
     }
@@ -639,28 +650,54 @@ details .row:last-of-type { margin-bottom: 8px; }
   /* ---------- Bluetooth ---------- */
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
+  function flagsOf(pr) {
+    return (pr.write ? 'W' : '') + (pr.writeWithoutResponse ? 'w' : '') + (pr.notify ? 'N' : '') + (pr.read ? 'R' : '');
+  }
+
+  // Все характеристики, в которые можно писать, лучшие первыми
   async function findWritable(server) {
     var services = await server.getPrimaryServices();
-    var best = null, bestRank = 999;
+    var list = [];
     for (var i = 0; i < services.length; i++) {
       var chars;
       log('Сервис ' + shortId(services[i].uuid));
       try { chars = await services[i].getCharacteristics(); } catch (e) { log('  не читается'); continue; }
       for (var j = 0; j < chars.length; j++) {
         var c = chars[j], pr = c.properties;
-        var flags = (pr.write ? 'W' : '') + (pr.writeWithoutResponse ? 'w' : '') + (pr.notify ? 'N' : '') + (pr.read ? 'R' : '');
-        log('  ' + shortId(c.uuid) + ' [' + flags + ']');
+        log('  ' + shortId(c.uuid) + ' [' + flagsOf(pr) + ']');
         if (!pr.write && !pr.writeWithoutResponse) continue;
         var known = KNOWN_WRITE.indexOf(String(c.uuid).toLowerCase());
-        var rank = known >= 0 ? known : 100 + (pr.write ? 0 : 1);
-        if (rank < bestRank) { best = c; bestRank = rank; }
+        // характеристики с уведомлениями обычно служебные, их в конец
+        var rank = known >= 0 ? known : 100 + (pr.notify ? 50 : 0) + (pr.write ? 0 : 1);
+        list.push({ ch: c, rank: rank, id: shortId(c.uuid), service: pr.notify && known < 0 });
       }
     }
-    return best;
+    list.sort(function (x, y) { return x.rank - y.rank; });
+    return list;
+  }
+
+  function pickChannel() {
+    var want = el.channel.value, list = state.writables, i;
+    if (!list.length) { state.ch = null; return; }
+    state.ch = list[0].ch;
+    for (i = 0; i < list.length; i++) if (list[i].id === want) state.ch = list[i].ch;
+    log('Пишу в ' + shortId(state.ch.uuid));
+  }
+
+  function fillChannels() {
+    el.channel.innerHTML = '';
+    var o = document.createElement('option');
+    o.value = 'auto'; o.textContent = 'Авто';
+    el.channel.appendChild(o);
+    state.writables.forEach(function (w) {
+      var op = document.createElement('option');
+      op.value = w.id; op.textContent = w.id + ' [' + flagsOf(w.ch.properties) + ']';
+      el.channel.appendChild(op);
+    });
   }
 
   function onDisconnected() {
-    state.ch = null;
+    state.ch = null; state.writables = [];
     el.linkName.textContent = 'Принтер не подключён';
     log('Принтер отключился');
     if (state.busy) setStatus('Связь с принтером прервалась. Подключите его снова.', 'error');
@@ -677,17 +714,18 @@ details .row:last-of-type { margin-bottom: 8px; }
       log('Устройство: ' + (device.name || 'без имени'));
       device.addEventListener('gattserverdisconnected', onDisconnected);
       var server = await device.gatt.connect();
-      var found = null;
+      var found = [];
       try { found = await findWritable(server); } catch (e) { log('Сервисы не найдены: ' + (e && e.message ? e.message : e)); }
-      if (!found) {
+      if (!found.length) {
         try { device.gatt.disconnect(); } catch (e) {}
         el.linkName.textContent = 'Принтер не подключён';
         setStatus('Устройство подключилось, но канал печати не найден. Похоже, это не тот прибор или у модели нестандартный Bluetooth.', 'error');
         return;
       }
       state.device = device;
-      state.ch = found;
-      log('Пишу в ' + shortId(found.uuid));
+      state.writables = found;
+      fillChannels();
+      pickChannel();
       el.linkName.textContent = device.name || 'Принтер подключён';
       setStatus('Принтер готов');
     } catch (e) {
@@ -712,16 +750,12 @@ details .row:last-of-type { margin-bottom: 8px; }
 
   function useResponse() {
     var m = el.wmode.value, pr = state.ch.properties;
-    if (m === 'with') return true;
-    if (m === 'without') return false;
-    if (!pr.writeWithoutResponse) return true;
-    if (!pr.write) return false;
-    // С подтверждением надёжнее, но быстрее ~2,5 КБ/с не разгоняется
-    return targetRate() <= 2500;
+    if (m === 'with') return !!pr.write || !pr.writeWithoutResponse;
+    if (m === 'without') return !pr.writeWithoutResponse;
+    return !!pr.write;
   }
 
-  async function writeChunk(part, withResponse) {
-    var c = state.ch;
+  async function writeChunk(c, part, withResponse) {
     if (withResponse) {
       if (c.writeValueWithResponse) await c.writeValueWithResponse(part);
       else await c.writeValue(part);
@@ -731,33 +765,44 @@ details .row:last-of-type { margin-bottom: 8px; }
     else await c.writeValue(part);
   }
 
+  // Отправка шагов задания. cfg: { ch, size, wr, rate }
+  async function transmit(steps, cfg, onProgress) {
+    var total = 0, done = 0, i;
+    for (i = 0; i < steps.length; i++) if (typeof steps[i] !== 'number') total += steps[i].length;
+    for (i = 0; i < steps.length; i++) {
+      var step = steps[i];
+      if (typeof step === 'number') { await sleep(step); continue; }
+      var segStart = Date.now(), segSent = 0;
+      for (var o = 0; o < step.length; o += cfg.size) {
+        if (!state.ch) throw new Error('disconnected');
+        var part = step.slice(o, o + cfg.size);
+        await writeChunk(cfg.ch, part, cfg.wr);
+        done += part.length;
+        segSent += part.length;
+        // держим ровный темп: не быстрее заданной скорости
+        var wait = segStart + segSent / cfg.rate * 1000 - Date.now();
+        if (wait > 0) await sleep(wait);
+        if (onProgress) onProgress(done / total);
+      }
+    }
+    return total;
+  }
+
+  function describe(cfg) {
+    return shortId(cfg.ch.uuid).slice(-4) + ', пакет ' + cfg.size + ', ' + (cfg.wr ? 'с подтв.' : 'без подтв.');
+  }
+
   async function send(steps, label) {
     if (!state.ch || state.busy) return;
     state.busy = true; refreshButtons();
     setStatus('');
-    var ok = false, t0 = Date.now();
-    var size = +el.chunk.value, wr = useResponse();
-    var total = 0, done = 0, i;
-    for (i = 0; i < steps.length; i++) if (typeof steps[i] !== 'number') total += steps[i].length;
-    var rate = targetRate();
-    log(label + ': ' + total + ' байт, пакет ' + size + ', ' + (wr ? 'с подтверждением' : 'без подтверждения') + ', цель ' + rate + ' Б/с');
+    var ok = false, t0 = Date.now(), total = 0;
+    var cfg = { ch: state.ch, size: +el.chunk.value, wr: useResponse(), rate: targetRate() };
+    log(label + ': ' + describe(cfg));
     try {
-      for (i = 0; i < steps.length; i++) {
-        var step = steps[i];
-        if (typeof step === 'number') { await sleep(step); continue; }
-        var segStart = Date.now(), segSent = 0;
-        for (var o = 0; o < step.length; o += size) {
-          if (!state.ch) throw new Error('disconnected');
-          var part = step.slice(o, o + size);
-          await writeChunk(part, wr);
-          done += part.length;
-          segSent += part.length;
-          // держим ровный темп: не быстрее заданной скорости
-          var wait = segStart + segSent / rate * 1000 - Date.now();
-          if (wait > 0) await sleep(wait);
-          el.printBtn.textContent = 'Печатаю… ' + Math.round(done / total * 100) + '%';
-        }
-      }
+      total = await transmit(steps, cfg, function (p) {
+        el.printBtn.textContent = 'Печатаю… ' + Math.round(p * 100) + '%';
+      });
       ok = true;
     } catch (e) {
       log('Ошибка: ' + (e && e.name ? e.name + ' ' : '') + (e && e.message ? e.message : e));
@@ -767,7 +812,7 @@ details .row:last-of-type { margin-bottom: 8px; }
       state.busy = false; refreshButtons();
       if (ok) {
         var sec = (Date.now() - t0) / 1000;
-        log('Отправлено за ' + sec.toFixed(1) + ' с, ' + Math.round(total / sec) + ' Б/с');
+        log('Отправлено ' + total + ' байт за ' + sec.toFixed(1) + ' с');
         setStatus('Отправлено на принтер');
       }
     }
@@ -775,15 +820,78 @@ details .row:last-of-type { margin-bottom: 8px; }
 
   function print() {
     if (!state.current) return;
-    var m = el.method.value;
-    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (' + el.start.value + ', яркость ' + el.density.value + ', ' + m + ')');
+    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (яркость ' + el.density.value + ')');
   }
 
   function testBar() {
     var w = +el.width.value, h = 96; // 12 мм
     var bits = new Uint8Array(w * h);
     bits.fill(1);
-    send(buildJob({ bits: bits, w: w, h: h }), 'Тест полосы (' + el.start.value + ', ' + el.method.value + ')');
+    send(buildJob({ bits: bits, w: w, h: h }), 'Тест полосы');
+  }
+
+  // Блок с крупным номером слева и сплошной чёрной плашкой справа
+  function numberBlock(n, w) {
+    var h = 64, cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    var ctx = cv.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = '#000';
+    ctx.font = '700 60px Helvetica, Arial, sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(String(n), 12, 56);
+    ctx.fillRect(Math.round(w / 2), 6, Math.round(w / 2) - 8, h - 12);
+    return toMono(cv, false);
+  }
+
+  // Перебирает каналы и способы отправки, каждый печатает свой номер
+  async function autoTest() {
+    if (!state.ch || state.busy) return;
+    var combos = [];
+    state.writables.forEach(function (w) {
+      if (w.service) return; // служебные каналы не трогаем
+      var pr = w.ch.properties;
+      if (pr.write) combos.push({ ch: w.ch, size: 20, wr: true });
+      if (pr.writeWithoutResponse) combos.push({ ch: w.ch, size: 20, wr: false });
+      if (pr.write) combos.push({ ch: w.ch, size: 160, wr: true });
+      if (pr.writeWithoutResponse) combos.push({ ch: w.ch, size: 160, wr: false });
+    });
+    state.busy = true; refreshButtons();
+    setStatus('Автопроверка: не трогайте принтер');
+    log('--- Автопроверка, способов: ' + combos.length + ' ---');
+    var W = +el.width.value;
+    try {
+      for (var i = 0; i < combos.length; i++) {
+        if (!state.ch) throw new Error('disconnected');
+        var cfg = combos[i];
+        cfg.rate = 2000;
+        var img = concat(rasterParts(numberBlock(i + 1, W), 64));
+        var steps = [
+          new Uint8Array([0x1B, 0x40]), 500,
+          new Uint8Array([0x1D, 0x49, 0xF0, 30]), 300,
+          img, 800,
+          new Uint8Array([0x0A, 0x0A]), 1200
+        ];
+        el.printBtn.textContent = 'Проверка ' + (i + 1) + ' из ' + combos.length;
+        var t0 = Date.now();
+        try {
+          await transmit(steps, cfg);
+          log('№' + (i + 1) + ': ' + describe(cfg) + ' — ' + ((Date.now() - t0 - 2800) / 1000).toFixed(1) + ' с');
+        } catch (e) {
+          log('№' + (i + 1) + ': ' + describe(cfg) + ' — ошибка: ' + (e && e.message ? e.message : e));
+          await sleep(500);
+        }
+      }
+      // отступ, чтобы последний блок вышел наружу
+      try { await transmit([new Uint8Array([0x0A, 0x0A, 0x0A, 0x0A])], { ch: state.ch, size: 20, wr: useResponse(), rate: 2000 }); } catch (e) {}
+      log('--- Готово. Какие номера видны на бумаге? ---');
+      setStatus('Автопроверка закончена');
+    } catch (e) {
+      log('Автопроверка прервана: ' + (e && e.message ? e.message : e));
+      setStatus('Связь с принтером прервалась. Подключите его снова.', 'error');
+    } finally {
+      state.busy = false; refreshButtons();
+    }
   }
 
   /* ---------- события ---------- */
@@ -831,6 +939,8 @@ details .row:last-of-type { margin-bottom: 8px; }
   });
   el.printBtn.addEventListener('click', print);
   el.testBar.addEventListener('click', testBar);
+  el.autoTest.addEventListener('click', autoTest);
+  el.channel.addEventListener('change', function () { if (state.writables.length) pickChannel(); });
 
   /* ---------- запуск ---------- */
   loadSettings();
