@@ -228,6 +228,15 @@ details .row:last-of-type { margin-bottom: 8px; }
       </div>
     </div>
     <div class="row">
+      <span class="field-label">Принтер</span>
+      <div class="grow">
+        <select id="start" aria-label="Тип принтера">
+          <option value="yhk" selected>YHK / WalkPrint</option>
+          <option value="plain">Обычный ESC/POS</option>
+        </select>
+      </div>
+    </div>
+    <div class="row">
       <span class="field-label">Команда</span>
       <div class="grow">
         <select id="method" aria-label="Команда печати">
@@ -280,7 +289,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 2</p>
+  <p class="version">Версия 3</p>
 </main>
 
 <div class="bar">
@@ -329,7 +338,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     text: $('text'), fontSize: $('fontSize'), fontSizeOut: $('fontSizeOut'),
     font: $('font'), bold: $('bold'), file: $('file'), fileLabel: $('fileLabel'),
     preview: $('preview'), empty: $('empty'), sizeNote: $('sizeNote'),
-    width: $('width'), method: $('method'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
+    width: $('width'), start: $('start'), method: $('method'), chunk: $('chunk'), wmode: $('wmode'), feed: $('feed'),
     testText: $('testText'), testBar: $('testBar'), log: $('log'),
     status: $('status'), printBtn: $('printBtn')
   };
@@ -349,15 +358,15 @@ details .row:last-of-type { margin-bottom: 8px; }
   }
   function shortId(uuid) {
     var m = /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/.exec(uuid);
-    return m ? m[1] : uuid.slice(0, 8);
+    return m ? m[1] : uuid.slice(0, 13);
   }
 
   /* ---------- сохранение настроек ---------- */
-  var KEY = 'thermal-ui-settings-v2';
+  var KEY = 'thermal-ui-settings-v3';
   function saveSettings() {
     try {
       localStorage.setItem(KEY, JSON.stringify({
-        width: el.width.value, method: el.method.value, chunk: el.chunk.value,
+        width: el.width.value, start: el.start.value, method: el.method.value, chunk: el.chunk.value,
         wmode: el.wmode.value, feed: el.feed.value,
         fontSize: el.fontSize.value, font: el.font.value, bold: el.bold.checked, align: state.align
       }));
@@ -368,6 +377,7 @@ details .row:last-of-type { margin-bottom: 8px; }
       var s = JSON.parse(localStorage.getItem(KEY) || 'null');
       if (!s) return;
       if (s.width) el.width.value = s.width;
+      if (s.start) el.start.value = s.start;
       if (s.method) el.method.value = s.method;
       if (s.chunk) el.chunk.value = s.chunk;
       if (s.wmode) el.wmode.value = s.wmode;
@@ -587,13 +597,24 @@ details .row:last-of-type { margin-bottom: 8px; }
     return out;
   }
 
+  // Задание = список шагов: Uint8Array отправляется, число означает паузу в миллисекундах
   function buildJob(mono) {
     var method = el.method.value;
-    var parts = method === 'column' ? columnParts(mono)
-              : rasterParts(mono, method === 'bands' ? BAND : mono.h);
+    var image = concat(method === 'column' ? columnParts(mono)
+                     : rasterParts(mono, method === 'bands' ? BAND : mono.h));
     var feed = +el.feed.value;
-    if (feed) { var lf = new Uint8Array(feed); lf.fill(0x0A); parts.push(lf); }
-    return concat(parts);
+    var lf = new Uint8Array(feed); lf.fill(0x0A);
+    var steps = [];
+    if (el.start.value === 'yhk') {
+      // Порядок как в приложении WalkPrint: сброс, запуск печати, картинка, отступ
+      steps.push(new Uint8Array([0x1B, 0x40]), 500);
+      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, 0x19]), 500);
+      steps.push(image, 500);
+    } else {
+      steps.push(image);
+    }
+    if (feed) steps.push(lf);
+    return steps;
   }
 
   /* ---------- Bluetooth ---------- */
@@ -689,18 +710,26 @@ details .row:last-of-type { margin-bottom: 8px; }
     await sleep(30);
   }
 
-  async function send(data, label) {
+  async function send(steps, label) {
     if (!state.ch || state.busy) return;
     state.busy = true; refreshButtons();
     setStatus('');
     var ok = false, t0 = Date.now();
     var size = +el.chunk.value, wr = useResponse();
-    log(label + ': ' + data.length + ' байт, пакет ' + size + ', ' + (wr ? 'с подтверждением' : 'без подтверждения'));
+    var total = 0, done = 0, i;
+    for (i = 0; i < steps.length; i++) if (typeof steps[i] !== 'number') total += steps[i].length;
+    log(label + ': ' + total + ' байт, пакет ' + size + ', ' + (wr ? 'с подтверждением' : 'без подтверждения'));
     try {
-      for (var o = 0; o < data.length; o += size) {
-        if (!state.ch) throw new Error('disconnected');
-        await writeChunk(data.slice(o, o + size), wr);
-        el.printBtn.textContent = 'Печатаю… ' + Math.round(Math.min(o + size, data.length) / data.length * 100) + '%';
+      for (i = 0; i < steps.length; i++) {
+        var step = steps[i];
+        if (typeof step === 'number') { await sleep(step); continue; }
+        for (var o = 0; o < step.length; o += size) {
+          if (!state.ch) throw new Error('disconnected');
+          var part = step.slice(o, o + size);
+          await writeChunk(part, wr);
+          done += part.length;
+          el.printBtn.textContent = 'Печатаю… ' + Math.round(done / total * 100) + '%';
+        }
       }
       ok = true;
     } catch (e) {
@@ -719,20 +748,20 @@ details .row:last-of-type { margin-bottom: 8px; }
   function print() {
     if (!state.current) return;
     var m = el.method.value;
-    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (' + m + ')');
+    send(buildJob(state.current), 'Печать ' + state.current.w + 'x' + state.current.h + ' (' + el.start.value + ', ' + m + ')');
   }
 
   function testText() {
     var s = 'TEST 12345\n\n\n\n', out = new Uint8Array(s.length);
     for (var i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-    send(out, 'Тест текста');
+    send([out], 'Тест текста');
   }
 
   function testBar() {
     var w = +el.width.value, h = 24;
     var bits = new Uint8Array(w * h);
     bits.fill(1);
-    send(buildJob({ bits: bits, w: w, h: h }), 'Тест полосы (' + el.method.value + ')');
+    send(buildJob({ bits: bits, w: w, h: h }), 'Тест полосы (' + el.start.value + ', ' + el.method.value + ')');
   }
 
   /* ---------- события ---------- */
@@ -754,7 +783,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   [el.font, el.bold, el.width].forEach(function (c) {
     c.addEventListener('change', function () { saveSettings(); schedule(); });
   });
-  [el.method, el.chunk, el.wmode, el.feed].forEach(function (c) { c.addEventListener('change', saveSettings); });
+  [el.start, el.method, el.chunk, el.wmode, el.feed].forEach(function (c) { c.addEventListener('change', saveSettings); });
 
   el.file.addEventListener('change', function () {
     var f = el.file.files && el.file.files[0];
