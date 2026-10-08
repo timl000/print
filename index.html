@@ -228,11 +228,12 @@ details .row:last-of-type { margin-bottom: 8px; }
       </div>
     </div>
     <div class="row">
-      <span class="field-label">Принтер</span>
+      <span class="field-label">Команды</span>
       <div class="grow">
-        <select id="start" aria-label="Тип принтера">
-          <option value="yhk" selected>YHK / WalkPrint</option>
-          <option value="plain">Обычный ESC/POS</option>
+        <select id="start" aria-label="Набор команд">
+          <option value="main" selected>Как в main.py</option>
+          <option value="yhk">С командой яркости</option>
+          <option value="plain">Только картинка</option>
         </select>
       </div>
     </div>
@@ -247,7 +248,7 @@ details .row:last-of-type { margin-bottom: 8px; }
       </div>
     </div>
     <div class="row">
-      <span class="field-label">Команда</span>
+      <span class="field-label">Картинка</span>
       <div class="grow">
         <select id="method" aria-label="Команда печати">
           <option value="raster" selected>Растр целиком (GS v 0)</option>
@@ -290,12 +291,13 @@ details .row:last-of-type { margin-bottom: 8px; }
         <select id="feed" aria-label="Пустых строк в конце">
           <option value="0">нет</option>
           <option value="2">2 строки</option>
-          <option value="4" selected>4 строки</option>
+          <option value="3" selected>3 строки</option>
+          <option value="4">4 строки</option>
           <option value="6">6 строк</option>
         </select>
       </div>
     </div>
-    <p class="hint">Канал, пакет и отправку подбирает автопроверка ниже: поставьте здесь те значения, с которыми номер вышел самым тёмным.</p>
+    <p class="hint">Яркость работает только с набором «С командой яркости». После печати под кнопкой показана реальная скорость отправки.</p>
   </details>
 
   <details>
@@ -308,7 +310,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 6</p>
+  <p class="version">Версия 7</p>
 </main>
 
 <div class="bar">
@@ -335,13 +337,13 @@ details .row:last-of-type { margin-bottom: 8px; }
   ];
   // Характеристики, в которые обычно пишут данные для печати (по убыванию приоритета)
   var KNOWN_WRITE = [
-    '49535343-6daa-4d02-abf6-19569aca69fe', // проверено на YHK: печатает через него
+    '49535343-8841-43f4-a8d4-ecbe34729bb3', // основной канал данных, умеет быструю отправку
     '00002af1-0000-1000-8000-00805f9b34fb',
     '0000ff02-0000-1000-8000-00805f9b34fb',
-    '49535343-8841-43f4-a8d4-ecbe34729bb3',
     'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f',
     '0000ffe1-0000-1000-8000-00805f9b34fb',
-    '0000fff2-0000-1000-8000-00805f9b34fb'
+    '0000fff2-0000-1000-8000-00805f9b34fb',
+    '49535343-6daa-4d02-abf6-19569aca69fe'
   ];
   var FONTS = {
     sans: 'Helvetica, Arial, sans-serif',
@@ -383,7 +385,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   }
 
   /* ---------- сохранение настроек ---------- */
-  var KEY = 'thermal-ui-settings-v5';
+  var KEY = 'thermal-ui-settings-v7';
   function saveSettings() {
     try {
       localStorage.setItem(KEY, JSON.stringify({
@@ -622,6 +624,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   // Скорость подачи данных, байт/с. Чем темнее печать, тем медленнее работает головка:
   // слишком быстро - переполнится буфер принтера, слишком медленно - белые полосы.
   function targetRate() {
+    if (el.start.value === 'main') return 2500;
     if (el.start.value !== 'yhk') return 4000;
     var d = +el.density.value;
     return d >= 30 ? 2000 : d >= 18 ? 3000 : 4500;
@@ -635,6 +638,10 @@ details .row:last-of-type { margin-bottom: 8px; }
     var feed = +el.feed.value;
     var lf = new Uint8Array(feed); lf.fill(0x0A);
     var steps = [];
+    if (el.start.value === 'main') {
+      // Точно как send_to_printer() в main.py: ESC @, картинка и переводы строки одним потоком
+      return [concat([new Uint8Array([0x1B, 0x40]), image, lf])];
+    }
     if (el.start.value === 'yhk') {
       // Порядок как в приложении WalkPrint: сброс, яркость (GS I F0 nn), картинка, отступ
       steps.push(new Uint8Array([0x1B, 0x40]), 500);
@@ -786,7 +793,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     var m = el.wmode.value, pr = state.ch.properties;
     if (m === 'with') return !!pr.write || !pr.writeWithoutResponse;
     if (m === 'without') return !pr.writeWithoutResponse;
-    return !!pr.write;
+    return !pr.writeWithoutResponse;
   }
 
   async function writeChunk(c, part, withResponse) {
@@ -801,7 +808,7 @@ details .row:last-of-type { margin-bottom: 8px; }
 
   // Отправка шагов задания. cfg: { ch, size, wr, rate }
   async function transmit(steps, cfg, onProgress) {
-    var total = 0, done = 0, i;
+    var total = 0, done = 0, writes = 0, active = 0, i;
     for (i = 0; i < steps.length; i++) if (typeof steps[i] !== 'number') total += steps[i].length;
     for (i = 0; i < steps.length; i++) {
       var step = steps[i];
@@ -811,6 +818,7 @@ details .row:last-of-type { margin-bottom: 8px; }
         if (!state.ch) throw new Error('disconnected');
         var part = step.slice(o, o + cfg.size);
         await writeChunk(cfg.ch, part, cfg.wr);
+        writes++;
         done += part.length;
         segSent += part.length;
         // держим ровный темп: не быстрее заданной скорости
@@ -818,8 +826,9 @@ details .row:last-of-type { margin-bottom: 8px; }
         if (wait > 0) await sleep(wait);
         if (onProgress) onProgress(done / total);
       }
+      active += Date.now() - segStart;
     }
-    return total;
+    return { total: total, writes: writes, ms: active };
   }
 
   function describe(cfg) {
@@ -830,25 +839,28 @@ details .row:last-of-type { margin-bottom: 8px; }
     if (!state.ch || state.busy) return;
     state.busy = true; refreshButtons();
     setStatus('');
-    var ok = false, t0 = Date.now(), total = 0;
+    var r = null;
     var cfg = { ch: state.ch, size: +el.chunk.value, wr: useResponse(), rate: targetRate() };
-    log(label + ': ' + describe(cfg));
+    log(label + ': ' + describe(cfg) + ', цель ' + cfg.rate + ' Б/с');
     try {
-      total = await transmit(steps, cfg, function (p) {
+      r = await transmit(steps, cfg, function (p) {
         el.printBtn.textContent = 'Печатаю… ' + Math.round(p * 100) + '%';
       });
-      ok = true;
     } catch (e) {
       log('Ошибка: ' + (e && e.name ? e.name + ' ' : '') + (e && e.message ? e.message : e));
       if (state.ch) setStatus('Отправка не удалась: ' + (e && e.message ? e.message : e), 'error');
       else setStatus('Связь с принтером прервалась. Подключите его снова.', 'error');
     } finally {
       state.busy = false; refreshButtons();
-      if (ok) {
-        var sec = (Date.now() - t0) / 1000;
-        log('Отправлено ' + total + ' байт за ' + sec.toFixed(1) + ' с');
-        setStatus('Отправлено на принтер');
-      }
+    }
+    if (!r) return;
+    var bps = r.ms > 0 ? Math.round(r.total / (r.ms / 1000)) : 0;
+    var per = r.writes ? Math.round(r.ms / r.writes) : 0;
+    log('Отправлено ' + r.total + ' байт, ' + r.writes + ' пакетов по ' + per + ' мс, ' + bps + ' Б/с');
+    if (r.writes >= 20 && bps < cfg.rate * 0.6) {
+      setStatus('Отправлено медленно: ' + bps + ' байт/с вместо ' + cfg.rate + '. Принтеру этого мало.', 'error');
+    } else {
+      setStatus('Отправлено: ' + bps + ' байт/с, ' + (cfg.wr ? 'с подтверждением' : 'потоком'));
     }
   }
 
