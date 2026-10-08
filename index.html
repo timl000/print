@@ -231,8 +231,8 @@ details .row:last-of-type { margin-bottom: 8px; }
       <span class="field-label">Команды</span>
       <div class="grow">
         <select id="start" aria-label="Набор команд">
-          <option value="main" selected>Как в main.py</option>
-          <option value="yhk">С командой яркости</option>
+          <option value="yhk" selected>YHK / WalkPrint</option>
+          <option value="main">Как в main.py</option>
           <option value="plain">Только картинка</option>
         </select>
       </div>
@@ -241,9 +241,9 @@ details .row:last-of-type { margin-bottom: 8px; }
       <span class="field-label">Яркость</span>
       <div class="grow">
         <select id="density" aria-label="Яркость печати">
-          <option value="12">Светлая, быстро</option>
-          <option value="18">Средняя</option>
-          <option value="30" selected>Тёмная, медленнее</option>
+          <option value="15">Светлая</option>
+          <option value="20">Средняя</option>
+          <option value="25" selected>Тёмная</option>
         </select>
       </div>
     </div>
@@ -269,9 +269,9 @@ details .row:last-of-type { margin-bottom: 8px; }
       <span class="field-label">Пакет</span>
       <div class="grow">
         <select id="chunk" aria-label="Размер пакета">
-          <option value="20" selected>20 байт</option>
+          <option value="20">20 байт</option>
           <option value="100">100 байт</option>
-          <option value="160">160 байт</option>
+          <option value="180" selected>180 байт</option>
         </select>
       </div>
     </div>
@@ -291,13 +291,13 @@ details .row:last-of-type { margin-bottom: 8px; }
         <select id="feed" aria-label="Пустых строк в конце">
           <option value="0">нет</option>
           <option value="2">2 строки</option>
-          <option value="3" selected>3 строки</option>
-          <option value="4">4 строки</option>
+          <option value="3">3 строки</option>
+          <option value="4" selected>4 строки</option>
           <option value="6">6 строк</option>
         </select>
       </div>
     </div>
-    <p class="hint">Яркость работает только с набором «С командой яркости». После печати под кнопкой показана реальная скорость отправки.</p>
+    <p class="hint">Низ картинки обрезан: уменьшите пакет до 100. Белые поперечные полосы: оставьте 180 и поставьте яркость светлее.</p>
   </details>
 
   <details>
@@ -310,7 +310,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 7</p>
+  <p class="version">Версия 8</p>
 </main>
 
 <div class="bar">
@@ -385,7 +385,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   }
 
   /* ---------- сохранение настроек ---------- */
-  var KEY = 'thermal-ui-settings-v7';
+  var KEY = 'thermal-ui-settings-v8';
   function saveSettings() {
     try {
       localStorage.setItem(KEY, JSON.stringify({
@@ -643,13 +643,13 @@ details .row:last-of-type { margin-bottom: 8px; }
       return [concat([new Uint8Array([0x1B, 0x40]), image, lf])];
     }
     if (el.start.value === 'yhk') {
-      // Порядок как в приложении WalkPrint: сброс, яркость (GS I F0 nn), картинка, отступ
-      steps.push(new Uint8Array([0x1B, 0x40]), 500);
-      steps.push(new Uint8Array([0x1D, 0x49, 0xF0, +el.density.value]), 300);
-      steps.push(image, 500);
-    } else {
-      steps.push(image);
+      // Задание WalkPrint для YHK одним потоком: сброс, старт с яркостью (1D 49 F0 nn),
+      // одна растровая команда, переводы строки. Без команды старта этот принтер не печатает.
+      return [concat([new Uint8Array([0x1B, 0x40]),
+                      new Uint8Array([0x1D, 0x49, 0xF0, +el.density.value]),
+                      image, lf]), 1500];
     }
+    steps.push(image);
     if (feed) steps.push(lf);
     return steps;
   }
@@ -793,7 +793,7 @@ details .row:last-of-type { margin-bottom: 8px; }
     var m = el.wmode.value, pr = state.ch.properties;
     if (m === 'with') return !!pr.write || !pr.writeWithoutResponse;
     if (m === 'without') return !pr.writeWithoutResponse;
-    return !pr.writeWithoutResponse;
+    return !!pr.write;
   }
 
   async function writeChunk(c, part, withResponse) {
@@ -821,9 +821,14 @@ details .row:last-of-type { margin-bottom: 8px; }
         writes++;
         done += part.length;
         segSent += part.length;
-        // держим ровный темп: не быстрее заданной скорости
-        var wait = segStart + segSent / cfg.rate * 1000 - Date.now();
-        if (wait > 0) await sleep(wait);
+        if (cfg.gap != null) {
+          // фиксированная пауза после пакета
+          if (cfg.gap > 0) await sleep(cfg.gap);
+        } else {
+          // ровный темп: не быстрее заданной скорости
+          var wait = segStart + segSent / cfg.rate * 1000 - Date.now();
+          if (wait > 0) await sleep(wait);
+        }
         if (onProgress) onProgress(done / total);
       }
       active += Date.now() - segStart;
@@ -840,8 +845,8 @@ details .row:last-of-type { margin-bottom: 8px; }
     state.busy = true; refreshButtons();
     setStatus('');
     var r = null;
-    var cfg = { ch: state.ch, size: +el.chunk.value, wr: useResponse(), rate: targetRate() };
-    log(label + ': ' + describe(cfg) + ', цель ' + cfg.rate + ' Б/с');
+    var cfg = { ch: state.ch, size: +el.chunk.value, wr: useResponse(), rate: targetRate(), gap: 40 };
+    log(label + ': ' + describe(cfg) + ', пауза ' + cfg.gap + ' мс');
     try {
       r = await transmit(steps, cfg, function (p) {
         el.printBtn.textContent = 'Печатаю… ' + Math.round(p * 100) + '%';
@@ -857,10 +862,10 @@ details .row:last-of-type { margin-bottom: 8px; }
     var bps = r.ms > 0 ? Math.round(r.total / (r.ms / 1000)) : 0;
     var per = r.writes ? Math.round(r.ms / r.writes) : 0;
     log('Отправлено ' + r.total + ' байт, ' + r.writes + ' пакетов по ' + per + ' мс, ' + bps + ' Б/с');
-    if (r.writes >= 20 && bps < cfg.rate * 0.6) {
-      setStatus('Отправлено медленно: ' + bps + ' байт/с вместо ' + cfg.rate + '. Принтеру этого мало.', 'error');
+    if (r.writes >= 8 && bps < 800) {
+      setStatus('Отправлено медленно: ' + bps + ' байт/с. Принтеру этого мало.', 'error');
     } else {
-      setStatus('Отправлено: ' + bps + ' байт/с, ' + (cfg.wr ? 'с подтверждением' : 'потоком'));
+      setStatus('Отправлено: ' + bps + ' байт/с');
     }
   }
 
@@ -918,8 +923,8 @@ details .row:last-of-type { margin-bottom: 8px; }
       { ch: main, size: 20, wr: true, kind: 'full' },
       { ch: alt, size: 20, wr: true, kind: 'full' },
       { ch: alt, size: 20, wr: false, kind: 'full' },
-      { ch: alt, size: 160, wr: false, kind: 'full' },
-      { ch: alt, size: 160, wr: true, kind: 'full' },
+      { ch: alt, size: 180, wr: false, kind: 'full' },
+      { ch: alt, size: 180, wr: true, kind: 'full' },
       { ch: main, size: 16, wr: true, kind: 'narrow' },
       { ch: main, size: 16, wr: true, kind: 'narrow2x' }
     ];
@@ -932,7 +937,7 @@ details .row:last-of-type { margin-bottom: 8px; }
         var t = tests[i], n = i + 1, body;
         t.rate = 2000;
         if (!t.wr && !t.ch.properties.writeWithoutResponse) { log('№' + n + ': пропущен, канал так не умеет'); continue; }
-        var steps = [new Uint8Array([0x1B, 0x40]), 500, new Uint8Array([0x1D, 0x49, 0xF0, 30]), 300];
+        var steps = [new Uint8Array([0x1B, 0x40]), 500, new Uint8Array([0x1D, 0x49, 0xF0, 0x19]), 300];
         if (t.kind === 'full') {
           steps.push(concat(rasterParts(numberBlock(n, W), 64)));
         } else {
