@@ -304,11 +304,11 @@ details .row:last-of-type { margin-bottom: 8px; }
       <button class="btn" id="autoTest" type="button" disabled>Автопроверка</button>
       <button class="btn" id="testBar" type="button" disabled>Напечатать полосу</button>
     </div>
-    <p class="hint">Автопроверка печатает несколько блоков с номерами, каждый своим способом. Занимает около минуты. Потом посмотрите, какие номера видны на бумаге.</p>
+    <p class="hint">Автопроверка печатает семь блоков с номерами, каждый своим способом. Занимает около минуты. Потом посмотрите, какие номера видны на бумаге, и пришлите журнал.</p>
     <pre class="log" id="log" aria-label="Журнал"></pre>
   </details>
 
-  <p class="version">Версия 5</p>
+  <p class="version">Версия 6</p>
 </main>
 
 <div class="bar">
@@ -365,7 +365,7 @@ details .row:last-of-type { margin-bottom: 8px; }
 
   var state = {
     mode: 'text', align: 'left',
-    device: null, ch: null, writables: [],
+    device: null, ch: null, writables: [], notifiers: [],
     img: null, current: null, busy: false
   };
 
@@ -658,6 +658,7 @@ details .row:last-of-type { margin-bottom: 8px; }
   async function findWritable(server) {
     var services = await server.getPrimaryServices();
     var list = [];
+    state.notifiers = [];
     for (var i = 0; i < services.length; i++) {
       var chars;
       log('Сервис ' + shortId(services[i].uuid));
@@ -665,7 +666,10 @@ details .row:last-of-type { margin-bottom: 8px; }
       for (var j = 0; j < chars.length; j++) {
         var c = chars[j], pr = c.properties;
         log('  ' + shortId(c.uuid) + ' [' + flagsOf(pr) + ']');
-        if (!pr.write && !pr.writeWithoutResponse) continue;
+        if (!pr.write && !pr.writeWithoutResponse) {
+          if (pr.notify) state.notifiers.push(c);
+          continue;
+        }
         var known = KNOWN_WRITE.indexOf(String(c.uuid).toLowerCase());
         // характеристики с уведомлениями обычно служебные, их в конец
         var rank = known >= 0 ? known : 100 + (pr.notify ? 50 : 0) + (pr.write ? 0 : 1);
@@ -681,7 +685,36 @@ details .row:last-of-type { margin-bottom: 8px; }
     if (!list.length) { state.ch = null; return; }
     state.ch = list[0].ch;
     for (i = 0; i < list.length; i++) if (list[i].id === want) state.ch = list[i].ch;
-    log('Пишу в ' + shortId(state.ch.uuid));
+    var c = state.ch;
+    log('Пишу в ' + shortId(c.uuid) + ', методы: ' + (c.writeValueWithResponse ? 'WR ' : '') +
+        (c.writeValueWithoutResponse ? 'WWR ' : '') + (c.writeValue ? 'WV' : ''));
+  }
+
+  function hex(view) {
+    var out = [];
+    for (var i = 0; i < view.byteLength && i < 24; i++) {
+      var b = view.getUint8(i).toString(16);
+      out.push(b.length < 2 ? '0' + b : b);
+    }
+    return out.join(' ') + (view.byteLength > 24 ? ' …' : '');
+  }
+
+  // Подписка на ответы принтера: некоторым модулям она нужна, чтобы принимать данные
+  var heard = 0;
+  async function listen() {
+    heard = 0;
+    for (var i = 0; i < state.notifiers.length; i++) {
+      var c = state.notifiers[i];
+      try {
+        await c.startNotifications();
+        c.addEventListener('characteristicvaluechanged', function (ev) {
+          if (heard++ < 12) log('Принтер ответил: ' + hex(ev.target.value));
+        });
+        log('Слушаю ' + shortId(c.uuid));
+      } catch (e) {
+        log('Не удалось слушать ' + shortId(c.uuid) + ': ' + (e && e.message ? e.message : e));
+      }
+    }
   }
 
   function fillChannels() {
@@ -726,6 +759,7 @@ details .row:last-of-type { margin-bottom: 8px; }
       state.writables = found;
       fillChannels();
       pickChannel();
+      await listen();
       el.linkName.textContent = device.name || 'Принтер подключён';
       setStatus('Принтер готов');
     } catch (e) {
@@ -844,46 +878,71 @@ details .row:last-of-type { margin-bottom: 8px; }
     return toMono(cv, false);
   }
 
-  // Перебирает каналы и способы отправки, каждый печатает свой номер
+  // Узкий блок: строка растра помещается в один пакет Bluetooth целиком
+  function narrowBlock(n, w, h) {
+    var cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    var ctx = cv.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = '#000';
+    var fs = Math.round(h * 0.9);
+    ctx.font = '700 ' + fs + 'px Helvetica, Arial, sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(String(n), 4, Math.round(h * 0.85));
+    ctx.fillRect(Math.round(w / 2), 3, Math.round(w / 2) - 4, h - 6);
+    return toMono(cv, false);
+  }
+
+  // Перебирает способы отправки, каждый печатает свой номер
   async function autoTest() {
     if (!state.ch || state.busy) return;
-    var combos = [];
+    var W = +el.width.value;
+    var main = state.ch, fast = null;
     state.writables.forEach(function (w) {
-      if (w.service) return; // служебные каналы не трогаем
-      var pr = w.ch.properties;
-      if (pr.write) combos.push({ ch: w.ch, size: 20, wr: true });
-      if (pr.writeWithoutResponse) combos.push({ ch: w.ch, size: 20, wr: false });
-      if (pr.write) combos.push({ ch: w.ch, size: 160, wr: true });
-      if (pr.writeWithoutResponse) combos.push({ ch: w.ch, size: 160, wr: false });
+      if (!fast && !w.service && w.ch.properties.writeWithoutResponse) fast = w.ch;
     });
+    var alt = fast || main;
+    var tests = [
+      { ch: main, size: 20, wr: true, kind: 'full' },
+      { ch: alt, size: 20, wr: true, kind: 'full' },
+      { ch: alt, size: 20, wr: false, kind: 'full' },
+      { ch: alt, size: 160, wr: false, kind: 'full' },
+      { ch: alt, size: 160, wr: true, kind: 'full' },
+      { ch: main, size: 16, wr: true, kind: 'narrow' },
+      { ch: main, size: 16, wr: true, kind: 'narrow2x' }
+    ];
     state.busy = true; refreshButtons();
     setStatus('Автопроверка: не трогайте принтер');
-    log('--- Автопроверка, способов: ' + combos.length + ' ---');
-    var W = +el.width.value;
+    log('--- Автопроверка ---');
     try {
-      for (var i = 0; i < combos.length; i++) {
+      for (var i = 0; i < tests.length; i++) {
         if (!state.ch) throw new Error('disconnected');
-        var cfg = combos[i];
-        cfg.rate = 2000;
-        var img = concat(rasterParts(numberBlock(i + 1, W), 64));
-        var steps = [
-          new Uint8Array([0x1B, 0x40]), 500,
-          new Uint8Array([0x1D, 0x49, 0xF0, 30]), 300,
-          img, 800,
-          new Uint8Array([0x0A, 0x0A]), 1200
-        ];
-        el.printBtn.textContent = 'Проверка ' + (i + 1) + ' из ' + combos.length;
-        var t0 = Date.now();
+        var t = tests[i], n = i + 1, body;
+        t.rate = 2000;
+        if (!t.wr && !t.ch.properties.writeWithoutResponse) { log('№' + n + ': пропущен, канал так не умеет'); continue; }
+        var steps = [new Uint8Array([0x1B, 0x40]), 500, new Uint8Array([0x1D, 0x49, 0xF0, 30]), 300];
+        if (t.kind === 'full') {
+          steps.push(concat(rasterParts(numberBlock(n, W), 64)));
+        } else {
+          // заголовок отдельным пакетом, дальше ровно одна строка (16 байт) на пакет
+          var mono = t.kind === 'narrow' ? narrowBlock(n, 128, 64) : narrowBlock(n, 128, 32);
+          body = rasterParts(mono, mono.h)[0];
+          if (t.kind === 'narrow2x') body[3] = 3; // двойная ширина и высота
+          steps.push(body.slice(0, 8), body.slice(8));
+        }
+        steps.push(800, new Uint8Array([0x0A, 0x0A]), 1200);
+        el.printBtn.textContent = 'Проверка ' + n + ' из ' + tests.length;
+        var t0 = Date.now(), what = describe(t) + (t.kind === 'full' ? '' : t.kind === 'narrow' ? ', узкий' : ', узкий x2');
         try {
-          await transmit(steps, cfg);
-          log('№' + (i + 1) + ': ' + describe(cfg) + ' — ' + ((Date.now() - t0 - 2800) / 1000).toFixed(1) + ' с');
+          await transmit(steps, t);
+          log('№' + n + ': ' + what + ' — ' + ((Date.now() - t0 - 2800) / 1000).toFixed(1) + ' с');
         } catch (e) {
-          log('№' + (i + 1) + ': ' + describe(cfg) + ' — ошибка: ' + (e && e.message ? e.message : e));
+          log('№' + n + ': ' + what + ' — ошибка: ' + (e && e.message ? e.message : e));
           await sleep(500);
         }
       }
       // отступ, чтобы последний блок вышел наружу
-      try { await transmit([new Uint8Array([0x0A, 0x0A, 0x0A, 0x0A])], { ch: state.ch, size: 20, wr: useResponse(), rate: 2000 }); } catch (e) {}
+      try { await transmit([new Uint8Array([0x0A, 0x0A, 0x0A, 0x0A])], { ch: main, size: 20, wr: !!main.properties.write, rate: 2000 }); } catch (e) {}
       log('--- Готово. Какие номера видны на бумаге? ---');
       setStatus('Автопроверка закончена');
     } catch (e) {
