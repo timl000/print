@@ -32,6 +32,7 @@ canvas{display:block;margin:0 auto;background:#fff;border-radius:6px;box-shadow:
   font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;max-height:40vh;overflow:auto}
 .row{display:flex;gap:10px;align-items:center;justify-content:space-between}
 .small{font-size:.85rem}
+.card button + button{margin-top:-2px}
 .ghost{background:transparent;color:var(--accent);padding:8px 10px;font-size:.95rem}
 </style>
 </head>
@@ -44,8 +45,11 @@ canvas{display:block;margin:0 auto;background:#fff;border-radius:6px;box-shadow:
 
   <div class="card">
     <canvas id="preview" width="384" height="10" aria-label="Что будет напечатано"></canvas>
-    <button id="printBtn" type="button">Напечатать «Привет!»</button>
+    <button id="textBtn" type="button">Тест 1: простой текст</button>
+    <button id="slowBtn" type="button">Тест 2: картинка медленно</button>
+    <button id="printBtn" type="button">Тест 3: картинка быстро</button>
     <div id="status">Готово к печати</div>
+    <p class="small">Нажмите по очереди и запомните, что напечатал каждый тест. Тест 1 печатает латиницей «Hello 123 OK».</p>
   </div>
 
   <div class="card">
@@ -71,7 +75,8 @@ const SERVICES = [
 const PREFERRED_CHAR = '49535343-8841-43f4-a8d4-ecbe34729bb3';  // ISSC: write here
 
 const $ = id => document.getElementById(id);
-const logEl = $('log'), statusEl = $('status'), btn = $('printBtn');
+const logEl = $('log'), statusEl = $('status');
+const buttons = [$('textBtn'), $('slowBtn'), $('printBtn')];
 function log(msg) {
   const t = new Date().toLocaleTimeString('ru-RU');
   logEl.textContent += `[${t}] ${msg}\n`;
@@ -155,37 +160,50 @@ async function connect() {
   log('Пишу в ' + writer.uuid + (writer.properties.writeWithoutResponse ? ' (без подтверждения)' : ' (с подтверждением)'));
 }
 
-async function send(data) {
-  // BLE takes small packets; start big, fall back to 20 bytes if the phone refuses
-  let chunk = 180;
-  const fast = writer.properties.writeWithoutResponse && writer.writeValueWithoutResponse;
+async function send(data, slow) {
+  // BLE takes small packets; start big, fall back to 20 bytes if the phone refuses.
+  // slow: 20-byte packets, each confirmed by the printer when it can, with pauses
+  let chunk = slow ? 20 : 180, packets = 0;
+  const canConfirm = writer.properties.write;
+  const fast = !(slow && canConfirm) && writer.properties.writeWithoutResponse && writer.writeValueWithoutResponse;
+  const t0 = performance.now();
+  log(`Отправка: ${data.length} байт, порции по ${chunk}, ${fast ? 'без подтверждения' : 'с подтверждением'}${slow ? ', медленно' : ''}`);
   for (let i = 0; i < data.length;) {
     const part = data.slice(i, i + chunk);
     try {
-      if (fast) { await writer.writeValueWithoutResponse(part); await sleep(12); }
+      if (fast) { await writer.writeValueWithoutResponse(part); await sleep(slow ? 40 : 12); }
       else if (writer.writeValueWithResponse) await writer.writeValueWithResponse(part);
       else await writer.writeValue(part);
     } catch (e) {
       if (chunk > 20) { log(`Порция ${chunk} байт не прошла (${e.message}), пробую по 20`); chunk = 20; continue; }
       throw e;
     }
-    i += part.length;
+    i += part.length; packets++;
+    if (slow && !fast) await sleep(10);
     status(`Печать… ${Math.round(100 * i / data.length)}%`);
   }
+  log(`Ушло ${packets} порций за ${((performance.now() - t0) / 1000).toFixed(1)} с`);
 }
 
-btn.addEventListener('click', async () => {
+function textTest() {
+  // the printer's own font: if this prints, the channel works and only pictures are the problem
+  const txt = 'Hello 123 OK\n';
+  const out = [0x1B, 0x40, ...Array.from(txt, ch => ch.charCodeAt(0)), 10, 10, 10];
+  return new Uint8Array(out);
+}
+
+async function run(kind) {
   if (!navigator.bluetooth) {
     status('Этот браузер не умеет Bluetooth', 'err');
     log('navigator.bluetooth нет. iPhone: откройте страницу в Bluefy. Android: в Chrome. Адрес должен начинаться с https://');
     return;
   }
-  btn.disabled = true;
+  buttons.forEach(b => { b.disabled = true; });
   try {
-    const data = encode(renderHello());
-    log(`Данные: ${data.length} байт`);
+    log('--- ' + {text: 'Тест 1: простой текст', slow: 'Тест 2: картинка медленно', fast: 'Тест 3: картинка быстро'}[kind]);
+    const data = kind === 'text' ? textTest() : encode(renderHello());
     await connect();
-    await send(data);
+    await send(data, kind === 'slow');
     status('Отправлено. Напечаталось?', 'ok');
     log('Отправлено');
   } catch (e) {
@@ -193,9 +211,12 @@ btn.addEventListener('click', async () => {
     status(cancelled ? 'Принтер не выбран' : 'Ошибка: ' + e.message, cancelled ? '' : 'err');
     log('Ошибка: ' + (e && e.name) + ': ' + (e && e.message));
   } finally {
-    btn.disabled = false;
+    buttons.forEach(b => { b.disabled = false; });
   }
-});
+}
+$('textBtn').addEventListener('click', () => run('text'));
+$('slowBtn').addEventListener('click', () => run('slow'));
+$('printBtn').addEventListener('click', () => run('fast'));
 
 $('copyBtn').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(logEl.textContent); $('copyBtn').textContent = 'Скопировано'; }
